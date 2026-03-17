@@ -53,6 +53,7 @@
   - [Exception Action (Side-Effect)](#exception-action-side-effect)
   - [Idempotent Command](#idempotent-command)
 - [File Structure](#file-structure)
+- [Performance](#performance)
 
 ---
 
@@ -121,7 +122,13 @@ using Helix;
 using Microsoft.Extensions.DependencyInjection;
 
 var services = new ServiceCollection();
+
+// Register Helix and scan the provided assemblies for all handlers, behaviors, and processors
 services.AddHelix(typeof(Program).Assembly);
+
+// Optional: enable zero-reflection source-generated dispatch (see Performance section)
+services.AddHelix(typeof(Program).Assembly).UseHelixCodeGen();
+
 var provider = services.BuildServiceProvider();
 ```
 
@@ -1015,6 +1022,38 @@ Helix/
     ├── IRequestExceptionHandler.cs    # Exception handler + state (recovery)
     ├── IRequestExceptionAction.cs     # Exception action (side-effects)
     ├── IHelix.cs                      # Helix contract (Send, SendCommand, SendQuery, Publish, CreateStream)
-    ├── DefaultHelix.cs                # Helix implementation (full pipeline)
-    └── ServiceCollectionExtensions.cs # AddHelix() registration + assembly scanning
+    ├── IHelixDispatchTable.cs         # Source-generated dispatch table contract (zero-reflection hot path)
+    ├── DefaultHelix.cs                # Helix implementation (full pipeline + reflection caching)
+    └── ServiceCollectionExtensions.cs # AddHelix() / UseHelixCodeGen() registration + assembly scanning
 ```
+
+---
+
+## Performance
+
+Helix operates in two dispatch modes that can coexist at runtime:
+
+| Mode | How to enable | Description |
+|---|---|---|
+| **Source-generated** | `.UseHelixCodeGen()` | An `IHelixDispatchTable` implementation generated at compile time dispatches pre-processors, validators, behaviors, the handler, and post-processors entirely through compile-time generics — no `MakeGenericType`, no `MethodInfo.Invoke`, no reflection on the hot path. |
+| **Reflection fallback** | Default (no extra config) | Used when no generated table is registered, or for request types not covered by the table. All reflection results are cached in static dictionaries after the first call for each type. |
+
+### Reflection Caching
+
+When the source-generated table is absent or does not cover a request type, `DefaultHelix` falls back to reflection. All expensive operations are computed once per unique `(requestType, responseType)` pair and stored in static `ConcurrentDictionary` caches:
+
+| Cache | Key | What is stored |
+|---|---|---|
+| `_dispatchCache` | `(requestType, responseType)` | Closed generic service types (`IRequestPreProcessor<T>`, `IRequestHandler<,>`, `IPipelineBehavior<,>`, `IRequestPostProcessor<,>`, conditional validator types) and their `MethodInfo` objects |
+| `_exceptionCache` | `(requestType, responseType)` | Closed generic types and `MethodInfo` for `IRequestExceptionHandler<,>` and `IRequestExceptionAction<>` |
+| `_streamCache` | `(requestType, responseType)` | Closed generic type and `MethodInfo` for `IStreamRequestHandler<,>` |
+| `_idempotencyCache` | `requestType` | The `PropertyInfo` for `IdempotencyKey` on the `IIdempotentCommand<>` interface, or `null` if the request type is not idempotent |
+
+The cache population cost is paid once per application lifetime per type pair. All subsequent dispatches for the same type pair are free of reflection metadata overhead.
+
+### Additional Optimizations
+
+- **`IIdempotencyStore`** is resolved from DI once at `DefaultHelix` construction, not on every `Send` call.
+- **`IHelixDispatchTable`** is likewise resolved once at construction.
+- **Behavior list** uses in-place `List<T>.Reverse()` to avoid the extra enumerator allocation that LINQ `.Reverse().ToList()` would incur.
+- **`SendCommand(ICommand)`** returns the inner `Task<Unit>` directly without an `async`/`await` wrapper, eliminating a state machine allocation on the void-command path.

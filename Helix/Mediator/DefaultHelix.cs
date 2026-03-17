@@ -16,14 +16,31 @@ namespace Helix;
 /// </summary>
 public sealed class DefaultHelix(IServiceProvider serviceProvider) : IHelix
 {
-    // Resolved once at construction; null when no generated table is registered.
-    private readonly IHelixDispatchTable? _dispatchTable = serviceProvider.GetService<IHelixDispatchTable>();
+    // Resolved once at construction; null when no generated table/store is registered.
+    private readonly IHelixDispatchTable? _dispatchTable    = serviceProvider.GetService<IHelixDispatchTable>();
+    private readonly IIdempotencyStore?   _idempotencyStore = serviceProvider.GetService<IIdempotencyStore>();
 
-    // Current — DI lookup on every Send()
-    private readonly IIdempotencyStore? _idempotencyStore =
-        serviceProvider.GetService<IIdempotencyStore>();
+    // ── Static reflection caches — computed once per unique (requestType, responseType) pair ──
 
-    private static readonly ConcurrentDictionary<Type, PropertyInfo?> _idempotencyKeyCache = new();
+    private static readonly ConcurrentDictionary<(Type, Type), DispatchEntry>  _dispatchCache    = new();
+    private static readonly ConcurrentDictionary<(Type, Type), ExceptionEntry> _exceptionCache   = new();
+    private static readonly ConcurrentDictionary<(Type, Type), StreamEntry>    _streamCache      = new();
+    private static readonly ConcurrentDictionary<Type, PropertyInfo?>          _idempotencyCache = new();
+
+    private sealed record DispatchEntry(
+        Type        PreProcessorType,      MethodInfo  PreProcessorProcess,
+        Type?       NoRespValidatorType,   MethodInfo? NoRespValidatorValidate,
+        Type?       ValidatorWithRespType, MethodInfo? ValidatorWithRespValidate,
+        Type        HandlerType,           MethodInfo  HandlerHandle,
+        Type        BehaviorType,          MethodInfo  BehaviorHandle,
+        Type        PostProcessorType,     MethodInfo  PostProcessorProcess);
+
+    private sealed record ExceptionEntry(
+        Type ExHandlerType, MethodInfo ExHandlerHandle,
+        Type ExActionType,  MethodInfo ExActionExecute);
+
+    private sealed record StreamEntry(
+        Type HandlerType, MethodInfo HandlerHandle);
 
     public async Task<TResponse> Send<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
     {
@@ -42,10 +59,7 @@ public sealed class DefaultHelix(IServiceProvider serviceProvider) : IHelix
                 }
                 else
                 {
-                    var requestType = request.GetType();
-
-                    // Populate once per request type:
-                    var keyProp = _idempotencyKeyCache.GetOrAdd(requestType, t =>
+                    var keyProp = _idempotencyCache.GetOrAdd(request.GetType(), static t =>
                         t.GetInterfaces()
                          .FirstOrDefault(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IIdempotentCommand<>))
                          ?.GetProperty("IdempotencyKey"));
@@ -66,8 +80,8 @@ public sealed class DefaultHelix(IServiceProvider serviceProvider) : IHelix
                 response = await DispatchViaReflection(request, cancellationToken);
 
             // 4b. Save idempotency
-            if (idempotencyKey.HasValue && _idempotencyStore is not null)
-                await _idempotencyStore.SaveAsync(idempotencyKey.Value, response, cancellationToken);
+            if (idempotencyKey.HasValue)
+                await _idempotencyStore!.SaveAsync(idempotencyKey.Value, response, cancellationToken);
 
             return response;
         }
@@ -75,26 +89,31 @@ public sealed class DefaultHelix(IServiceProvider serviceProvider) : IHelix
         {
             // requestType is only computed on the error path
             var requestType = request.GetType();
+            var entry = _exceptionCache.GetOrAdd((requestType, typeof(TResponse)), static key =>
+            {
+                var (reqType, respType) = key;
+                var exHandlerType = typeof(IRequestExceptionHandler<,>).MakeGenericType(reqType, respType);
+                var exActionType  = typeof(IRequestExceptionAction<>).MakeGenericType(reqType);
+                return new ExceptionEntry(
+                    exHandlerType, exHandlerType.GetMethod("Handle")!,
+                    exActionType,  exActionType.GetMethod("Execute")!);
+            });
 
             // 5. Exception handlers — can recover by supplying a replacement response
-            var exHandlerType = typeof(IRequestExceptionHandler<,>).MakeGenericType(requestType, typeof(TResponse));
             var state = new RequestExceptionHandlerState<TResponse>();
 
-            foreach (var exHandler in serviceProvider.GetServices(exHandlerType))
+            foreach (var exHandler in serviceProvider.GetServices(entry.ExHandlerType))
             {
-                await (Task)exHandlerType.GetMethod("Handle")!
-                    .Invoke(exHandler, [request, ex, state, cancellationToken])!;
+                await (Task)entry.ExHandlerHandle.Invoke(exHandler, [request, ex, state, cancellationToken])!;
 
                 if (state.Handled)
                     break;
             }
 
             // 6. Exception actions — side effects (logging, metrics) that always run
-            var exActionType = typeof(IRequestExceptionAction<>).MakeGenericType(requestType);
-            foreach (var exAction in serviceProvider.GetServices(exActionType))
+            foreach (var exAction in serviceProvider.GetServices(entry.ExActionType))
             {
-                await (Task)exActionType.GetMethod("Execute")!
-                    .Invoke(exAction, [request, ex, cancellationToken])!;
+                await (Task)entry.ExActionExecute.Invoke(exAction, [request, ex, cancellationToken])!;
             }
 
             if (state.Handled)
@@ -110,35 +129,65 @@ public sealed class DefaultHelix(IServiceProvider serviceProvider) : IHelix
     {
         var requestType = request.GetType();
 
-        // 1. Pre-processors
-        var preProcessorType = typeof(IRequestPreProcessor<>).MakeGenericType(requestType);
-        foreach (var preProcessor in serviceProvider.GetServices(preProcessorType))
+        var entry = _dispatchCache.GetOrAdd((requestType, typeof(TResponse)), static key =>
         {
-            await (Task)preProcessorType.GetMethod("Process")!
-                .Invoke(preProcessor, [request, cancellationToken])!;
+            var (reqType, respType) = key;
+
+            var preProcessorType  = typeof(IRequestPreProcessor<>).MakeGenericType(reqType);
+            var handlerType       = typeof(IRequestHandler<,>).MakeGenericType(reqType, respType);
+            var behaviorType      = typeof(IPipelineBehavior<,>).MakeGenericType(reqType, respType);
+            var postProcessorType = typeof(IRequestPostProcessor<,>).MakeGenericType(reqType, respType);
+
+            // ICommandValidator<TCommand> has constraint: where TCommand : ICommand
+            Type? noRespValidatorType = null;
+            MethodInfo? noRespValidatorValidate = null;
+            if (typeof(ICommand).IsAssignableFrom(reqType))
+            {
+                noRespValidatorType    = typeof(ICommandValidator<>).MakeGenericType(reqType);
+                noRespValidatorValidate = noRespValidatorType.GetMethod("Validate")!;
+            }
+
+            // ICommandValidator<TCommand, TResponse> has constraint: where TCommand : ICommand<TResponse>
+            Type? validatorWithRespType = null;
+            MethodInfo? validatorWithRespValidate = null;
+            if (reqType.GetInterfaces().Any(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(ICommand<>)))
+            {
+                validatorWithRespType    = typeof(ICommandValidator<,>).MakeGenericType(reqType, respType);
+                validatorWithRespValidate = validatorWithRespType.GetMethod("Validate")!;
+            }
+
+            return new DispatchEntry(
+                preProcessorType,    preProcessorType.GetMethod("Process")!,
+                noRespValidatorType, noRespValidatorValidate,
+                validatorWithRespType, validatorWithRespValidate,
+                handlerType,         handlerType.GetMethod("Handle")!,
+                behaviorType,        behaviorType.GetMethod("Handle")!,
+                postProcessorType,   postProcessorType.GetMethod("Process")!);
+        });
+
+        // 1. Pre-processors
+        foreach (var preProcessor in serviceProvider.GetServices(entry.PreProcessorType))
+        {
+            await (Task)entry.PreProcessorProcess.Invoke(preProcessor, [request, cancellationToken])!;
         }
 
         // 1b. Command validators
         var failures = new List<ValidationFailure>();
 
-        if (request is ICommand)
+        if (entry.NoRespValidatorType is not null)
         {
-            var validatorType = typeof(ICommandValidator<>).MakeGenericType(requestType);
-            foreach (var validator in serviceProvider.GetServices(validatorType))
+            foreach (var validator in serviceProvider.GetServices(entry.NoRespValidatorType))
             {
-                var result = await (Task<ValidationResult>)validatorType.GetMethod("Validate")!
-                    .Invoke(validator, [request, cancellationToken])!;
+                var result = await (Task<ValidationResult>)entry.NoRespValidatorValidate!.Invoke(validator, [request, cancellationToken])!;
                 failures.AddRange(result.Errors);
             }
         }
 
-        if (requestType.GetInterfaces().Any(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(ICommand<>)))
+        if (entry.ValidatorWithRespType is not null)
         {
-            var validatorWithResponseType = typeof(ICommandValidator<,>).MakeGenericType(requestType, typeof(TResponse));
-            foreach (var validator in serviceProvider.GetServices(validatorWithResponseType))
+            foreach (var validator in serviceProvider.GetServices(entry.ValidatorWithRespType))
             {
-                var result = await (Task<ValidationResult>)validatorWithResponseType.GetMethod("Validate")!
-                    .Invoke(validator, [request, cancellationToken])!;
+                var result = await (Task<ValidationResult>)entry.ValidatorWithRespValidate!.Invoke(validator, [request, cancellationToken])!;
                 failures.AddRange(result.Errors);
             }
         }
@@ -147,40 +196,28 @@ public sealed class DefaultHelix(IServiceProvider serviceProvider) : IHelix
             throw new ValidationException(failures);
 
         // 2. Resolve handler
-        var handlerType = typeof(IRequestHandler<,>).MakeGenericType(requestType, typeof(TResponse));
-        var handler = serviceProvider.GetService(handlerType)
+        var handler = serviceProvider.GetService(entry.HandlerType)
             ?? throw new InvalidOperationException($"No handler registered for {requestType.Name}.");
 
         // 3. Build behavior pipeline around the handler
-        var behaviors = serviceProvider
-            .GetServices(typeof(IPipelineBehavior<,>).MakeGenericType(requestType, typeof(TResponse)))
-            .ToList();
+        var behaviors = serviceProvider.GetServices(entry.BehaviorType).ToList();
         behaviors.Reverse();
 
-        var handlerHandleMethod = handlerType.GetMethod("Handle")!;
         RequestHandlerDelegate<TResponse> pipeline = () =>
-            (Task<TResponse>)handlerHandleMethod.Invoke(handler, [request, cancellationToken])!;
+            (Task<TResponse>)entry.HandlerHandle.Invoke(handler, [request, cancellationToken])!;
 
-        if (behaviors.Count > 0)
+        foreach (var behavior in behaviors)
         {
-            var behaviorType = typeof(IPipelineBehavior<,>).MakeGenericType(requestType, typeof(TResponse));
-            var behaviorHandleMethod = behaviorType.GetMethod("Handle")!;
-
-            foreach (var behavior in behaviors)
-            {
-                var current = pipeline;
-                pipeline = () => (Task<TResponse>)behaviorHandleMethod.Invoke(behavior, [request, current, cancellationToken])!;
-            }
+            var current = pipeline;
+            pipeline = () => (Task<TResponse>)entry.BehaviorHandle.Invoke(behavior, [request, current, cancellationToken])!;
         }
 
         var response = await pipeline();
 
         // 4. Post-processors
-        var postProcessorType = typeof(IRequestPostProcessor<,>).MakeGenericType(requestType, typeof(TResponse));
-        foreach (var postProcessor in serviceProvider.GetServices(postProcessorType))
+        foreach (var postProcessor in serviceProvider.GetServices(entry.PostProcessorType))
         {
-            await (Task)postProcessorType.GetMethod("Process")!
-                .Invoke(postProcessor, [request, response, cancellationToken])!;
+            await (Task)entry.PostProcessorProcess.Invoke(postProcessor, [request, response, cancellationToken])!;
         }
 
         return response;
@@ -212,11 +249,16 @@ public sealed class DefaultHelix(IServiceProvider serviceProvider) : IHelix
         else
         {
             var requestType = request.GetType();
-            var handlerType = typeof(IStreamRequestHandler<,>).MakeGenericType(requestType, typeof(TResponse));
-            var handler = serviceProvider.GetService(handlerType)
+            var entry = _streamCache.GetOrAdd((requestType, typeof(TResponse)), static key =>
+            {
+                var (reqType, respType) = key;
+                var handlerType = typeof(IStreamRequestHandler<,>).MakeGenericType(reqType, respType);
+                return new StreamEntry(handlerType, handlerType.GetMethod("Handle")!);
+            });
+
+            var handler = serviceProvider.GetService(entry.HandlerType)
                 ?? throw new InvalidOperationException($"No stream handler registered for {requestType.Name}.");
-            stream = (IAsyncEnumerable<TResponse>)handlerType.GetMethod("Handle")!
-                .Invoke(handler, [request, cancellationToken])!;
+            stream = (IAsyncEnumerable<TResponse>)entry.HandlerHandle.Invoke(handler, [request, cancellationToken])!;
         }
 
         await foreach (var item in stream.WithCancellation(cancellationToken))
