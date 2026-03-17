@@ -5,6 +5,7 @@ namespace Helix.Tests;
 public class QueryTests
 {
     private readonly IHelix _helix;
+    private readonly IHelix _helixCodeGen;
 
     public QueryTests()
     {
@@ -12,8 +13,13 @@ public class QueryTests
         services.AddSingleton<CallTracker>();
         services.AddHelix(typeof(QueryTests).Assembly);
         var provider = services.BuildServiceProvider();
-
         _helix = provider.GetRequiredService<IHelix>();
+
+        var cgServices = new ServiceCollection();
+        cgServices.AddSingleton<CallTracker>();
+        cgServices.AddHelix(typeof(QueryTests).Assembly).UseHelixCodeGen();
+        var cgProvider = cgServices.BuildServiceProvider();
+        _helixCodeGen = cgProvider.GetRequiredService<IHelix>();
     }
 
     [Fact]
@@ -31,6 +37,15 @@ public class QueryTests
         var result = await _helix.SendQuery(new TestGetOrderQuery("ORD-002"));
 
         Assert.Equal("ORD-002", result.Id);
+        Assert.Equal(42, result.Quantity);
+    }
+
+    [Fact]
+    public async Task Send_Query_CodeGen_ReturnsExpectedResult()
+    {
+        var result = await _helixCodeGen.Send(new TestGetOrderQuery("ORD-003"));
+
+        Assert.Equal("ORD-003", result.Id);
         Assert.Equal(42, result.Quantity);
     }
 
