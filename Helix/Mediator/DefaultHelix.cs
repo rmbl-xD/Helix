@@ -17,6 +17,32 @@ public sealed class DefaultHelix(IServiceProvider serviceProvider) : IHelix
 
         try
         {
+            // 0. Idempotency check
+            Guid? idempotencyKey = null;
+            var idempotencyStore = serviceProvider.GetService<IIdempotencyStore>();
+
+            if (idempotencyStore is not null)
+            {
+                if (request is IIdempotentCommand idempotentCmd)
+                {
+                    idempotencyKey = idempotentCmd.IdempotencyKey;
+                }
+                else
+                {
+                    var idempotentInterface = requestType.GetInterfaces()
+                        .FirstOrDefault(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IIdempotentCommand<>));
+                    if (idempotentInterface is not null)
+                    {
+                        idempotencyKey = (Guid)idempotentInterface.GetProperty("IdempotencyKey")!.GetValue(request)!;
+                    }
+                }
+
+                if (idempotencyKey.HasValue && await idempotencyStore.ExistsAsync(idempotencyKey.Value, cancellationToken))
+                {
+                    return (await idempotencyStore.GetResponseAsync<TResponse>(idempotencyKey.Value, cancellationToken))!;
+                }
+            }
+
             // 1. Pre-processors
             var preProcessorType = typeof(IRequestPreProcessor<>).MakeGenericType(requestType);
             foreach (var preProcessor in serviceProvider.GetServices(preProcessorType))
@@ -24,6 +50,34 @@ public sealed class DefaultHelix(IServiceProvider serviceProvider) : IHelix
                 await (Task)preProcessorType.GetMethod("Process")!
                     .Invoke(preProcessor, [request, cancellationToken])!;
             }
+
+            // 1b. Command validators
+            var failures = new List<ValidationFailure>();
+
+            if (request is ICommand)
+            {
+                var validatorType = typeof(ICommandValidator<>).MakeGenericType(requestType);
+                foreach (var validator in serviceProvider.GetServices(validatorType))
+                {
+                    var result = await (Task<ValidationResult>)validatorType.GetMethod("Validate")!
+                        .Invoke(validator, [request, cancellationToken])!;
+                    failures.AddRange(result.Errors);
+                }
+            }
+
+            if (requestType.GetInterfaces().Any(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(ICommand<>)))
+            {
+                var validatorWithResponseType = typeof(ICommandValidator<,>).MakeGenericType(requestType, typeof(TResponse));
+                foreach (var validator in serviceProvider.GetServices(validatorWithResponseType))
+                {
+                    var result = await (Task<ValidationResult>)validatorWithResponseType.GetMethod("Validate")!
+                        .Invoke(validator, [request, cancellationToken])!;
+                    failures.AddRange(result.Errors);
+                }
+            }
+
+            if (failures.Count > 0)
+                throw new ValidationException(failures);
 
             // 2. Resolve handler
             var handlerType = typeof(IRequestHandler<,>).MakeGenericType(requestType, typeof(TResponse));
@@ -61,6 +115,12 @@ public sealed class DefaultHelix(IServiceProvider serviceProvider) : IHelix
             {
                 await (Task)postProcessorType.GetMethod("Process")!
                     .Invoke(postProcessor, [request, response, cancellationToken])!;
+            }
+
+            // 4b. Save idempotency
+            if (idempotencyKey.HasValue && idempotencyStore is not null)
+            {
+                await idempotencyStore.SaveAsync(idempotencyKey.Value, response, cancellationToken);
             }
 
             return response;
@@ -130,4 +190,13 @@ public sealed class DefaultHelix(IServiceProvider serviceProvider) : IHelix
             yield return item;
         }
     }
+
+    public Task<TResponse> SendCommand<TResponse>(ICommand<TResponse> command, CancellationToken cancellationToken = default)
+        => Send(command, cancellationToken);
+
+    public async Task SendCommand(ICommand command, CancellationToken cancellationToken = default)
+        => await Send(command, cancellationToken);
+
+    public Task<TResponse> SendQuery<TResponse>(IQuery<TResponse> query, CancellationToken cancellationToken = default)
+        => Send(query, cancellationToken);
 }

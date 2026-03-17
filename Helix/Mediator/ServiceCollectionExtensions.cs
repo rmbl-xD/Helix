@@ -26,6 +26,8 @@ public static class ServiceCollectionExtensions
             ScanAndRegister(services, assembly, typeof(IRequestPostProcessor<,>));
             ScanAndRegister(services, assembly, typeof(IRequestExceptionHandler<,>));
             ScanAndRegister(services, assembly, typeof(IRequestExceptionAction<>));
+            ScanAndRegister(services, assembly, typeof(ICommandValidator<>));
+            ScanAndRegister(services, assembly, typeof(ICommandValidator<,>));
         }
 
         return services;
