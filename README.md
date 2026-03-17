@@ -60,70 +60,50 @@
 
 ### Request Pipeline (`Send` / `SendCommand` / `SendQuery`)
 
-```
-IHelix.Send(request)  /  SendCommand(command)  /  SendQuery(query)
-    │
-    ▼
-┌─ Idempotency Check ────────────────┐
-│  IIdempotencyStore (if registered)  │  ← Return cached response for duplicate commands
-└─────────────────────────────────────┘
-    │
-    ▼
-┌─ Pre-Processors ───────────────────┐
-│  IRequestPreProcessor<TRequest>     │  ← Enrichment, normalization
-└─────────────────────────────────────┘
-    │
-    ▼
-┌─ Command Validators ───────────────┐
-│  ICommandValidator<TCommand>        │  ← Aggregated validation (commands only)
-│  ICommandValidator<TCmd, TResponse> │  ← Throws ValidationException on failure
-└─────────────────────────────────────┘
-    │
-    ▼
-┌─ Pipeline Behaviors ───────────────┐
-│  ┌──────────────────────────────┐  │
-│  │  Behavior 1 (before)         │  │  ← IPipelineBehavior / ICommandBehavior / IQueryBehavior
-│  │  ┌────────────────────────┐  │  │
-│  │  │  Behavior 2 (before)   │  │  │
-│  │  │  ┌──────────────────┐  │  │  │
-│  │  │  │  Handler          │  │  │  │  ← ICommandHandler / IQueryHandler
-│  │  │  └──────────────────┘  │  │  │
-│  │  │  Behavior 2 (after)    │  │  │
-│  │  └────────────────────────┘  │  │
-│  │  Behavior 1 (after)          │  │
-│  └──────────────────────────────┘  │
-└─────────────────────────────────────┘
-    │
-    ▼
-┌─ Post-Processors ──────────────────┐
-│  IRequestPostProcessor<TReq, TRes>  │  ← Auditing, cache population
-└─────────────────────────────────────┘
-    │
-    ▼
-┌─ Idempotency Save ─────────────────┐
-│  IIdempotencyStore (if applicable)  │  ← Persist response for future deduplication
-└─────────────────────────────────────┘
-    │
-    ▼
-  TResponse
+```mermaid
+flowchart TD
+    start(["Send / SendCommand / SendQuery"]) --> idem_check{"Idempotency Check"}
+    idem_check -->|cached| cached_resp(["Return cached response"])
+    idem_check -->|new request| pre["Pre-Processors\nIRequestPreProcessor"]
+    pre --> validators{"Command Validators\nICommandValidator"}
+    validators -->|errors| val_ex(["throw ValidationException"])
+    validators -->|valid| behaviors
 
-On exception at any stage:
-  → IRequestExceptionHandler  (can recover with a replacement response)
-  → IRequestExceptionAction   (side-effects: logging, metrics — always runs)
+    subgraph behaviors ["Pipeline Behaviors — Russian-doll"]
+        direction TB
+        b1_before["Behavior 1 — before"] --> b2_before["Behavior 2 — before"]
+        b2_before --> handler["Handler\nICommandHandler / IQueryHandler"]
+        handler --> b2_after["Behavior 2 — after"]
+        b2_after --> b1_after["Behavior 1 — after"]
+    end
+
+    behaviors --> post["Post-Processors\nIRequestPostProcessor"]
+    post --> idem_save["Idempotency Save"]
+    idem_save --> response(["TResponse"])
+
+    behaviors -.->|exception| exc_handling
+    subgraph exc_handling ["Exception Handling"]
+        direction TB
+        exc_handlers["Exception Handlers\nIRequestExceptionHandler"] --> exc_actions["Exception Actions\nIRequestExceptionAction"]
+    end
+    exc_handling -->|recovered| response
+    exc_handling -->|unhandled| throw_ex(["throw"])
 ```
 
 ### Notification Pipeline (`Publish`)
 
-```
-IHelix.Publish(notification)  →  Handler 1 → Handler 2 → ...  (sequential fan-out)
+```mermaid
+flowchart LR
+    pub(["Publish(notification)"]) --> h1["Handler 1"] --> h2["Handler 2"] --> hn["Handler N"]
 ```
 
-Works for both `INotification` and `IDomainEvent` types.
+Works for both `INotification` and `IDomainEvent` types. All handlers execute **sequentially**.
 
 ### Stream Pipeline (`CreateStream`)
 
-```
-IHelix.CreateStream(request)  →  IStreamRequestHandler  →  IAsyncEnumerable<T>
+```mermaid
+flowchart LR
+    cs(["CreateStream(request)"]) --> handler["IStreamRequestHandler"] --> result(["IAsyncEnumerable‹T›"])
 ```
 
 Works for both `IStreamRequest<T>` and `IStreamQuery<T>` types.
@@ -504,19 +484,31 @@ If an exception occurs at **any** stage:
 11. All **`IRequestExceptionAction<TRequest>`** instances run (always, even if recovered).
 12. If recovered, the replacement response is returned. Otherwise, the exception propagates.
 
-```
-Send(request)
-  → Idempotency check (return cached if duplicate)
-  → PreProcessor1.Process(request)
-  → PreProcessor2.Process(request)
-  → Validator1.Validate(command) → Validator2.Validate(command) → throw if errors
-  → Behavior1.Handle(request, next: →
-      Behavior2.Handle(request, next: →
-        Handler.Handle(request)))
-  → PostProcessor1.Process(request, response)
-  → PostProcessor2.Process(request, response)
-  → Idempotency save
-  → return response
+```mermaid
+sequenceDiagram
+    actor Caller
+    participant Helix as DefaultHelix
+    participant Pre as PreProcessors
+    participant Val as Validators
+    participant B1 as Behavior 1
+    participant B2 as Behavior 2
+    participant H as Handler
+    participant Post as PostProcessors
+
+    Caller->>Helix: Send(request)
+    Note over Helix: Check idempotency store
+    Helix->>Pre: Process(request)
+    Helix->>Val: Validate(command)
+    Note over Val: throw if errors
+    Helix->>B1: Handle(request, next)
+    B1->>B2: Handle(request, next)
+    B2->>H: Handle(request)
+    H-->>B2: response
+    B2-->>B1: response
+    B1-->>Helix: response
+    Helix->>Post: Process(request, response)
+    Note over Helix: Save to idempotency store
+    Helix-->>Caller: TResponse
 ```
 
 When you call `helix.Publish(notification)`:
