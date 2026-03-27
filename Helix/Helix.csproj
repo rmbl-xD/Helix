@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
 
     <!-- NuGet package metadata -->
-    <PackageId>Helix</PackageId>
+    <PackageId>Helix.CQRS</PackageId>
     <Version>1.0.1</Version>
     <Authors>Francesco Caprio</Authors>
     <Description>Helix CQRS Library</Description>
