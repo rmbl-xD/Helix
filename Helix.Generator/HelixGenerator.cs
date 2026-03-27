@@ -1,0 +1,350 @@
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Text;
+using System.Threading;
+
+namespace Helix.Generator;
+
+[Generator]
+public sealed class HelixGenerator : IIncrementalGenerator
+{
+    private const string HelixNamespace = "Helix";
+
+    public void Initialize(IncrementalGeneratorInitializationContext context)
+    {
+        var requestHandlers = context.SyntaxProvider
+            .CreateSyntaxProvider(
+                predicate: static (node, _) => node is ClassDeclarationSyntax { BaseList: not null },
+                transform: GetRequestHandlerInfo)
+            .Where(static info => info.HasValue)
+            .Select(static (info, _) => info!.Value)
+            .Collect();
+
+        var streamHandlers = context.SyntaxProvider
+            .CreateSyntaxProvider(
+                predicate: static (node, _) => node is ClassDeclarationSyntax { BaseList: not null },
+                transform: GetStreamHandlerInfo)
+            .Where(static info => info.HasValue)
+            .Select(static (info, _) => info!.Value)
+            .Collect();
+
+        context.RegisterSourceOutput(
+            requestHandlers.Combine(streamHandlers),
+            static (ctx, pair) => Generate(ctx, pair.Left, pair.Right));
+    }
+
+    private static RequestHandlerInfo? GetRequestHandlerInfo(GeneratorSyntaxContext ctx, CancellationToken ct)
+    {
+        if (ctx.SemanticModel.GetDeclaredSymbol(ctx.Node, ct) is not INamedTypeSymbol symbol)
+            return null;
+
+        if (symbol.IsAbstract || symbol.IsGenericType)
+            return null;
+
+        foreach (var iface in symbol.AllInterfaces)
+        {
+            if (!iface.IsGenericType || iface.TypeArguments.Length != 2)
+                continue;
+
+            var orig = iface.OriginalDefinition;
+            if (orig.MetadataName != "IRequestHandler`2" ||
+                orig.ContainingNamespace?.ToDisplayString() != HelixNamespace)
+                continue;
+
+            if (iface.TypeArguments[0] is not INamedTypeSymbol requestType)
+                continue;
+
+            var responseType = iface.TypeArguments[1];
+
+            bool isCommandNoResponse = false;
+            bool isCommandWithResponse = false;
+
+            foreach (var reqIface in requestType.AllInterfaces)
+            {
+                if (reqIface.ContainingNamespace?.ToDisplayString() != HelixNamespace)
+                    continue;
+
+                if (!reqIface.IsGenericType && reqIface.MetadataName == "ICommand")
+                    isCommandNoResponse = true;
+
+                if (reqIface.IsGenericType && reqIface.OriginalDefinition.MetadataName == "ICommand`1")
+                    isCommandWithResponse = true;
+            }
+
+            return new RequestHandlerInfo(
+                requestFqn: requestType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                responseFqn: responseType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                isCommandNoResponse: isCommandNoResponse,
+                isCommandWithResponse: isCommandWithResponse);
+        }
+
+        return null;
+    }
+
+    private static StreamHandlerInfo? GetStreamHandlerInfo(GeneratorSyntaxContext ctx, CancellationToken ct)
+    {
+        if (ctx.SemanticModel.GetDeclaredSymbol(ctx.Node, ct) is not INamedTypeSymbol symbol)
+            return null;
+
+        if (symbol.IsAbstract || symbol.IsGenericType)
+            return null;
+
+        foreach (var iface in symbol.AllInterfaces)
+        {
+            if (!iface.IsGenericType || iface.TypeArguments.Length != 2)
+                continue;
+
+            var orig = iface.OriginalDefinition;
+            if (orig.MetadataName != "IStreamRequestHandler`2" ||
+                orig.ContainingNamespace?.ToDisplayString() != HelixNamespace)
+                continue;
+
+            return new StreamHandlerInfo(
+                requestFqn: iface.TypeArguments[0].ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                responseFqn: iface.TypeArguments[1].ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat));
+        }
+
+        return null;
+    }
+
+    private static void Generate(
+        SourceProductionContext ctx,
+        ImmutableArray<RequestHandlerInfo> requestHandlers,
+        ImmutableArray<StreamHandlerInfo> streamHandlers)
+    {
+        if (requestHandlers.IsEmpty && streamHandlers.IsEmpty)
+            return;
+
+        var requests = Deduplicate(requestHandlers);
+        var streams = DeduplicateStreams(streamHandlers);
+
+        var sb = new StringBuilder();
+        AppendSource(sb, requests, streams);
+        ctx.AddSource("HelixDispatchTable.g.cs", sb.ToString());
+    }
+
+    private static void AppendSource(
+        StringBuilder sb,
+        List<RequestHandlerInfo> requests,
+        List<StreamHandlerInfo> streams)
+    {
+        sb.AppendLine("// <auto-generated/>");
+        sb.AppendLine("#nullable enable");
+        sb.AppendLine("using System.Linq;");
+        sb.AppendLine("using Microsoft.Extensions.DependencyInjection;");
+        sb.AppendLine();
+        sb.AppendLine("namespace Helix");
+        sb.AppendLine("{");
+
+        // ── HelixDispatchTable ────────────────────────────────────────────────
+        sb.AppendLine("    internal sealed class HelixDispatchTable : global::Helix.IHelixDispatchTable");
+        sb.AppendLine("    {");
+        sb.AppendLine("        private readonly global::System.IServiceProvider _sp;");
+        sb.AppendLine();
+        sb.AppendLine("        public HelixDispatchTable(global::System.IServiceProvider sp) => _sp = sp;");
+        sb.AppendLine();
+
+        // TryDispatch
+        sb.AppendLine("        public bool TryDispatch<TResponse>(");
+        sb.AppendLine("            global::Helix.IRequest<TResponse> request,");
+        sb.AppendLine("            global::System.Threading.CancellationToken ct,");
+        sb.AppendLine("            out global::System.Threading.Tasks.Task<TResponse> result)");
+        sb.AppendLine("        {");
+        foreach (var h in requests)
+        {
+            var id = SafeId(h.RequestFqn);
+            sb.AppendLine($"            if (request is {h.RequestFqn} _r_{id})");
+            sb.AppendLine("            {");
+            sb.AppendLine($"                result = (global::System.Threading.Tasks.Task<TResponse>)(object)Execute_{id}(_r_{id}, ct);");
+            sb.AppendLine("                return true;");
+            sb.AppendLine("            }");
+        }
+        sb.AppendLine("            result = null!;");
+        sb.AppendLine("            return false;");
+        sb.AppendLine("        }");
+        sb.AppendLine();
+
+        // TryDispatchStream
+        sb.AppendLine("        public bool TryDispatchStream<TResponse>(");
+        sb.AppendLine("            global::Helix.IStreamRequest<TResponse> request,");
+        sb.AppendLine("            global::System.Threading.CancellationToken ct,");
+        sb.AppendLine("            out global::System.Collections.Generic.IAsyncEnumerable<TResponse> result)");
+        sb.AppendLine("        {");
+        foreach (var h in streams)
+        {
+            var id = SafeId(h.RequestFqn);
+            sb.AppendLine($"            if (request is {h.RequestFqn} _s_{id})");
+            sb.AppendLine("            {");
+            sb.AppendLine($"                result = (global::System.Collections.Generic.IAsyncEnumerable<TResponse>)(object)Stream_{id}(_s_{id}, ct);");
+            sb.AppendLine("                return true;");
+            sb.AppendLine("            }");
+        }
+        sb.AppendLine("            result = null!;");
+        sb.AppendLine("            return false;");
+        sb.AppendLine("        }");
+        sb.AppendLine();
+
+        // Execute_X methods — full pipeline, zero reflection
+        foreach (var h in requests)
+        {
+            var id = SafeId(h.RequestFqn);
+            sb.AppendLine($"        private async global::System.Threading.Tasks.Task<{h.ResponseFqn}> Execute_{id}(");
+            sb.AppendLine($"            {h.RequestFqn} request,");
+            sb.AppendLine("            global::System.Threading.CancellationToken ct)");
+            sb.AppendLine("        {");
+
+            // Pre-processors
+            sb.AppendLine($"            foreach (var __pp in _sp.GetServices<global::Helix.IRequestPreProcessor<{h.RequestFqn}>>())");
+            sb.AppendLine("                await __pp.Process(request, ct).ConfigureAwait(false);");
+            sb.AppendLine();
+
+            // Validators
+            bool needsValidation = h.IsCommandNoResponse || h.IsCommandWithResponse;
+            if (needsValidation)
+            {
+                sb.AppendLine("            var __failures = new global::System.Collections.Generic.List<global::Helix.ValidationFailure>();");
+
+                // ICommandValidator<TCommand> requires TCommand : ICommand (void variant only)
+                if (h.IsCommandNoResponse)
+                {
+                    sb.AppendLine($"            foreach (var __v in _sp.GetServices<global::Helix.ICommandValidator<{h.RequestFqn}>>())");
+                    sb.AppendLine("            {");
+                    sb.AppendLine("                var __vr = await __v.Validate(request, ct).ConfigureAwait(false);");
+                    sb.AppendLine("                __failures.AddRange(__vr.Errors);");
+                    sb.AppendLine("            }");
+                }
+
+                // ICommandValidator<TCommand, TResponse> requires TCommand : ICommand<TResponse>
+                if (h.IsCommandWithResponse)
+                {
+                    sb.AppendLine($"            foreach (var __v in _sp.GetServices<global::Helix.ICommandValidator<{h.RequestFqn}, {h.ResponseFqn}>>())");
+                    sb.AppendLine("            {");
+                    sb.AppendLine("                var __vr = await __v.Validate(request, ct).ConfigureAwait(false);");
+                    sb.AppendLine("                __failures.AddRange(__vr.Errors);");
+                    sb.AppendLine("            }");
+                }
+
+                sb.AppendLine("            if (__failures.Count > 0)");
+                sb.AppendLine("                throw new global::Helix.ValidationException(__failures);");
+                sb.AppendLine();
+            }
+
+            // Handler + behaviors
+            sb.AppendLine($"            var __handler = _sp.GetRequiredService<global::Helix.IRequestHandler<{h.RequestFqn}, {h.ResponseFqn}>>();");
+            sb.AppendLine($"            var __behaviors = _sp.GetServices<global::Helix.IPipelineBehavior<{h.RequestFqn}, {h.ResponseFqn}>>().Reverse().ToList();");
+            sb.AppendLine($"            global::Helix.RequestHandlerDelegate<{h.ResponseFqn}> __pipeline = () => __handler.Handle(request, ct);");
+            sb.AppendLine("            foreach (var __b in __behaviors)");
+            sb.AppendLine("            {");
+            sb.AppendLine("                var __next = __pipeline;");
+            sb.AppendLine("                var __beh = __b;");
+            sb.AppendLine($"                __pipeline = () => __beh.Handle(request, __next, ct);");
+            sb.AppendLine("            }");
+            sb.AppendLine();
+            sb.AppendLine("            var __response = await __pipeline().ConfigureAwait(false);");
+            sb.AppendLine();
+
+            // Post-processors
+            sb.AppendLine($"            foreach (var __pp in _sp.GetServices<global::Helix.IRequestPostProcessor<{h.RequestFqn}, {h.ResponseFqn}>>())");
+            sb.AppendLine("                await __pp.Process(request, __response, ct).ConfigureAwait(false);");
+            sb.AppendLine();
+            sb.AppendLine("            return __response;");
+            sb.AppendLine("        }");
+            sb.AppendLine();
+        }
+
+        // Stream_X methods
+        foreach (var h in streams)
+        {
+            var id = SafeId(h.RequestFqn);
+            sb.AppendLine($"        private global::System.Collections.Generic.IAsyncEnumerable<{h.ResponseFqn}> Stream_{id}(");
+            sb.AppendLine($"            {h.RequestFqn} request,");
+            sb.AppendLine("            global::System.Threading.CancellationToken ct)");
+            sb.AppendLine("        {");
+            sb.AppendLine($"            var __handler = _sp.GetRequiredService<global::Helix.IStreamRequestHandler<{h.RequestFqn}, {h.ResponseFqn}>>();");
+            sb.AppendLine("            return __handler.Handle(request, ct);");
+            sb.AppendLine("        }");
+            sb.AppendLine();
+        }
+
+        sb.AppendLine("    }");
+        sb.AppendLine();
+
+        // ── UseHelixCodeGen registration extension ────────────────────────────
+        sb.AppendLine("    internal static class HelixCodeGenExtensions");
+        sb.AppendLine("    {");
+        sb.AppendLine("        /// <summary>");
+        sb.AppendLine("        /// Registers the source-generated <see cref=\"HelixDispatchTable\"/> so that");
+        sb.AppendLine("        /// <see cref=\"DefaultHelix\"/> routes requests without any reflection.");
+        sb.AppendLine("        /// Call this after <c>AddHelix()</c>.");
+        sb.AppendLine("        /// </summary>");
+        sb.AppendLine("        public static global::Microsoft.Extensions.DependencyInjection.IServiceCollection UseHelixCodeGen(");
+        sb.AppendLine("            this global::Microsoft.Extensions.DependencyInjection.IServiceCollection services)");
+        sb.AppendLine("        {");
+        sb.AppendLine("            services.AddSingleton<global::Helix.IHelixDispatchTable, HelixDispatchTable>();");
+        sb.AppendLine("            return services;");
+        sb.AppendLine("        }");
+        sb.AppendLine("    }");
+        sb.AppendLine("}");
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static string SafeId(string fqn)
+    {
+        var sb = new StringBuilder(fqn.Length);
+        foreach (var c in fqn)
+            sb.Append(char.IsLetterOrDigit(c) ? c : '_');
+        return sb.ToString();
+    }
+
+    private static List<RequestHandlerInfo> Deduplicate(ImmutableArray<RequestHandlerInfo> array)
+    {
+        var seen = new HashSet<string>();
+        var result = new List<RequestHandlerInfo>();
+        foreach (var item in array)
+            if (seen.Add(item.RequestFqn + "|" + item.ResponseFqn))
+                result.Add(item);
+        return result;
+    }
+
+    private static List<StreamHandlerInfo> DeduplicateStreams(ImmutableArray<StreamHandlerInfo> array)
+    {
+        var seen = new HashSet<string>();
+        var result = new List<StreamHandlerInfo>();
+        foreach (var item in array)
+            if (seen.Add(item.RequestFqn + "|" + item.ResponseFqn))
+                result.Add(item);
+        return result;
+    }
+
+    // Value types with manual equality to avoid record/init issues on netstandard2.0
+    private struct RequestHandlerInfo
+    {
+        public readonly string RequestFqn;
+        public readonly string ResponseFqn;
+        public readonly bool IsCommandNoResponse;
+        public readonly bool IsCommandWithResponse;
+
+        public RequestHandlerInfo(string requestFqn, string responseFqn, bool isCommandNoResponse, bool isCommandWithResponse)
+        {
+            RequestFqn = requestFqn;
+            ResponseFqn = responseFqn;
+            IsCommandNoResponse = isCommandNoResponse;
+            IsCommandWithResponse = isCommandWithResponse;
+        }
+    }
+
+    private struct StreamHandlerInfo
+    {
+        public readonly string RequestFqn;
+        public readonly string ResponseFqn;
+
+        public StreamHandlerInfo(string requestFqn, string responseFqn)
+        {
+            RequestFqn = requestFqn;
+            ResponseFqn = responseFqn;
+        }
+    }
+}
