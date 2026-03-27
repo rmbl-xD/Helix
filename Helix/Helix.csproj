@@ -26,6 +26,13 @@
                       OutputItemType="Analyzer" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="..\Helix.Generator\bin\$(Configuration)\netstandard2.0\Helix.Generator.dll"
+          Pack="true"
+          PackagePath="analyzers/dotnet/cs"
+          Visible="false" />
+  </ItemGroup>
+
   <Target Name="KiotaRestore" BeforeTargets="KiotaGenerate">
     <Exec Command="dotnet tool restore" WorkingDirectory="$(SolutionDir)" />
   </Target>
