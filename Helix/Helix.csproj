@@ -19,6 +19,13 @@
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.3" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\Helix.Generator\Helix.Generator.csproj"
+                      PrivateAssets="all"
+                      ReferenceOutputAssembly="false"
+                      OutputItemType="Analyzer" />
+  </ItemGroup>
+
   <Target Name="KiotaRestore" BeforeTargets="KiotaGenerate">
     <Exec Command="dotnet tool restore" WorkingDirectory="$(SolutionDir)" />
   </Target>
