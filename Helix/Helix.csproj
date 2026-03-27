@@ -10,4 +10,9 @@
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.3" />
   </ItemGroup>
 
+  <Target Name="KiotaRestore" BeforeTargets="KiotaGenerate">
+    <Exec Command="dotnet tool restore" WorkingDirectory="$(SolutionDir)" />
+  </Target>
+
+
 </Project>
