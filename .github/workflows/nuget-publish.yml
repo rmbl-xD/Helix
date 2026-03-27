@@ -56,6 +56,3 @@ jobs:
           --source ${{ env.FEED_URL }}
           --api-key ${{ secrets.NUGET_API_KEY }}
           --skip-duplicate
-
-      - name: Add Helix.CQRS Package
-        run: dotnet add package Helix.CQRS
