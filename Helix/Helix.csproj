@@ -4,6 +4,15 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+
+    <!-- NuGet package metadata -->
+    <PackageId>Helix</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Francesco Caprio</Authors>
+    <Description>Helix CQRS Library</Description>
+    <RepositoryUrl>https://github.com/rmbl-xD/Helix</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
   </PropertyGroup>
 
   <ItemGroup>
