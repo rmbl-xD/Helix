@@ -8,15 +8,12 @@ on:
 
 env:
   PROJECT_PATH: Helix/Helix.csproj
-  FEED_URL: https://nuget.pkg.github.com/rmbl-xD/index.json
+  FEED_URL: https://api.nuget.org/v3/index.json
 
 jobs:
   publish:
     name: Build & Publish
     runs-on: ubuntu-latest
-    permissions:
-      packages: write   # required to push to GitHub Packages
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,9 +22,6 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.x"
-          source-url: ${{ env.FEED_URL }}
-        env:
-          NUGET_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Restore dependencies
         run: dotnet restore ${{ env.PROJECT_PATH }}
@@ -56,9 +50,12 @@ jobs:
           --output ./nupkgs
           /p:Version=${{ steps.version.outputs.VERSION }}
 
-      - name: Push to GitHub Packages
+      - name: Push to nuget.org
         run: >
           dotnet nuget push ./nupkgs/*.nupkg
           --source ${{ env.FEED_URL }}
-          --api-key ${{ secrets.GITHUB_TOKEN }}
+          --api-key ${{ secrets.NUGET_API_KEY }}
           --skip-duplicate
+
+      - name: Add Helix.CQRS Package
+        run: dotnet add package Helix.CQRS
