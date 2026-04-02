@@ -282,7 +282,7 @@ public sealed class HelixGenerator : IIncrementalGenerator
         sb.AppendLine("        public static global::Microsoft.Extensions.DependencyInjection.IServiceCollection UseHelixCodeGen(");
         sb.AppendLine("            this global::Microsoft.Extensions.DependencyInjection.IServiceCollection services)");
         sb.AppendLine("        {");
-        sb.AppendLine("            services.AddSingleton<global::Helix.IHelixDispatchTable, HelixDispatchTable>();");
+        sb.AppendLine("            services.AddScoped<global::Helix.IHelixDispatchTable, HelixDispatchTable>();");
         sb.AppendLine("            return services;");
         sb.AppendLine("        }");
         sb.AppendLine("    }");
